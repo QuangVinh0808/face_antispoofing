@@ -1,0 +1,1 @@
+"""Benchmark protocol definitions."""

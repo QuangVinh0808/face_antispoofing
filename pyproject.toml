@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "improved-ddpm-fas"
+version = "1.2.0"
+description = "Controlled E0-E6 MSU-MFSD/SiW-Mv2 frequency-aware DDPM face anti-spoofing benchmark"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+where = ["src"]

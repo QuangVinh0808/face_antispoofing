@@ -1,0 +1,7 @@
+datasets:
+  M:
+    manifest_dir: data/processed/MSU-MFSD/official/face_context
+    data_root: data/processed/MSU-MFSD/official/face_context
+  S:
+    manifest_dir: data/processed/SiW-Mv2/protocol_1/face_context
+    data_root: data/processed/SiW-Mv2/protocol_1/face_context

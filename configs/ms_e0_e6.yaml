@@ -1,0 +1,88 @@
+image_size: 224
+batch_size: 16
+amp_channels: 3
+data:
+  manifest_dir: data/benchmarks/cross_dataset_ms/M_to_S
+  data_root: null
+  dataset_roots: {}
+  num_workers: 4
+  seed: 42
+  sampler: class_balanced
+frequency:
+  # The runner injects source-train FFT stats for E1-E6; E0 keeps this null.
+  normalization_file: null
+  require_train_stats: false
+training:
+  # Step-based budget: identical optimizer-update budget for M_to_S and S_to_M.
+  # Set max_steps: null and provide --epochs only for legacy/smoke runs.
+  epochs: null
+  max_steps: 3000
+  eval_every_steps: 300
+  min_steps: 1200
+  early_stopping_patience: 4
+  early_stopping_min_delta: 0.001
+  log_every: 10
+  checkpoint_dir: data/experiments/manual/checkpoints
+  log_dir: data/experiments/manual/logs
+diffusion:
+  base_channels: 64
+  channel_mults: [1, 2, 4, 8]
+  attention_resolutions: [16, 8]
+  num_heads: 4
+  T: 1000
+  s: 0.008
+  lam_vlb: 0.001
+  lr: 0.0002
+  sampling_k: 20
+  sampling_k_candidates: [20, 50, 100]
+  grad_clip_norm: 1.0
+  # Injected by the runner for E6. This is attack-only source-train normalization.
+  normalization_file: null
+  # E6 must use a separately pretrained and frozen generator.
+  pretrained_checkpoint: null
+  freeze_pretrained: true
+  pretrain_steps: 3000
+classifier:
+  feat_dim: 256
+  num_classes: 2
+  alpha_center: 0.2
+  lambda_contrastive: 1.0
+  lr: 0.0001
+  pretrained_backbone: true
+patch:
+  scale_min: 0.2
+  scale_max: 1.0
+evaluation:
+  threshold_method: eer
+  aggregation_candidates: [mean]
+  trim_ratio: 0.1
+  topk_ratio: 0.25
+  tpr_fprs: [0.01, 0.001]
+experiment:
+  variant: E0
+  overrides: {}
+stage6:
+  enabled: false
+  variant: D0
+  experiment_variant: E0
+  ddpm_mode: none
+  augmentation_ratio: 0.0
+  # No online warm-up: the DDPM is pretrained separately and then frozen.
+  warmup_steps: 0
+  class_balanced: true
+  # Canonical E6 uses A_syn=A_DDPM; no A_mix interpolation.
+  synthetic_strength: 1.0
+  quality_control:
+    enabled: true
+    # First attempt + at most 3 retries. Remaining rejected slots are filled
+    # with real attacks, preserving the 8-live/8-attack classifier prior.
+    max_retries: 3
+    # Clamp generated normalized log-amplitude before inverse-log expansion.
+    normalized_amplitude_clip: 3.0
+    # Numerical hard gate. Spectral thresholds are calibrated from source-train.
+    max_clip_ratio: 0.01
+    spectral_calibration_file: null
+    # Fail closed if the generator remains unreliable for a sustained window.
+    rolling_window_batches: 100
+    min_rolling_acceptance_rate: 0.80
+    stop_on_nonfinite: true

@@ -1,0 +1,38 @@
+# Dataset
+data/
+raw_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+venv/
+env/
+myenv/
+.venv/
+
+# Checkpoints / model weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Logs
+*.log
+logs/
+
+# Outputs
+outputs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+E6_pretrained_v5_replacement_files.tar.gz
+log_dataset_processed.txt
+full_train_log.txt

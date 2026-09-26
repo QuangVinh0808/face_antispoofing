@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: improved-ddpm-fas
+Version: 1.2.0
+Summary: Controlled E0-E6 MSU-MFSD/SiW-Mv2 frequency-aware DDPM face anti-spoofing benchmark
+Requires-Python: >=3.9
