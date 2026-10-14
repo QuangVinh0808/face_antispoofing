@@ -24,6 +24,21 @@ from improved_ddpm.models.unet import UNet
 from improved_ddpm.diffusion.diffusion import GaussianDiffusion
 from .frequency_utils import FrequencyUtils
 from .frequency_normalization import FFTNormalizationStats
+from .ddpm_representation import RadialAmplitudeStats, radial_coordinate
+
+
+class RadiusConditionedUNet(UNet):
+    """Clean radius is a conditioning channel, NOT a diffused/output channel."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        conv = self.input_conv
+        self.input_conv = nn.Conv2d(conv.in_channels + 1, conv.out_channels, 3, padding=1)
+        self.register_buffer("radius_map", radial_coordinate(kwargs["image_size"], kwargs["image_size"])[None, None], persistent=False)
+
+    def forward(self, x, t, condition=None):
+        radius = self.radius_map.to(x).expand(x.shape[0], -1, -1, -1)
+        return super().forward(torch.cat((x, radius), dim=1), t, condition=condition)
 
 
 class ImprovedAmplitudeDDPM(nn.Module):
@@ -51,13 +66,16 @@ class ImprovedAmplitudeDDPM(nn.Module):
         device: str = "cpu",
         normalization_stats: Optional[FFTNormalizationStats] = None,
         num_conditions: int = 0,
+        radius_conditioning: bool = False,
     ):
         super().__init__()
         self.device = device
         self.lam_vlb = lam_vlb
         self.normalization_stats = normalization_stats
+        self.radius_conditioning = bool(radius_conditioning)
 
-        self.unet = UNet(
+        unet_type = RadiusConditionedUNet if self.radius_conditioning else UNet
+        self.unet = unet_type(
             in_channels=in_channels,
             base_channels=base_channels,
             channel_mults=channel_mults,
@@ -86,6 +104,11 @@ class ImprovedAmplitudeDDPM(nn.Module):
             - mean, std:    de denormalize khi sample xong
         """
         amplitude, phase = FrequencyUtils.fft_decompose(rgb_image)
+        if isinstance(self.normalization_stats, RadialAmplitudeStats):
+            encoded = self.normalization_stats.encode(amplitude)
+            # Keep the four-value API for existing call sites; the transform is
+            # nonlinear, so these legacy scalar slots are intentionally None.
+            return encoded, phase, None, None
         log_amp = FrequencyUtils.log_amplitude(amplitude)
         if self.normalization_stats is None:
             # Legacy/demo fallback. Benchmark runs should always supply train-only stats.
@@ -122,6 +145,7 @@ class ImprovedAmplitudeDDPM(nn.Module):
         std=None,
         condition=None,
         normalized_clip: float = 3.0,
+        clip_denoised: Optional[bool] = None,
     ):
         """
         Sinh ma tran amplitude gia mao MOI bang fast sampling (K buoc << T).
@@ -130,16 +154,38 @@ class ImprovedAmplitudeDDPM(nn.Module):
         Tra ve: amplitude THO (da denormalize + inverse log), san sang ghep voi Phase thuc.
         """
         self.unet.eval()
+        normalized_clip = float(normalized_clip)
+        if normalized_clip <= 0:
+            raise ValueError("normalized_clip must be > 0")
+        is_r2 = isinstance(self.normalization_stats, RadialAmplitudeStats) and self.normalization_stats.mode == "radial_q95_sqrt"
+        clip_denoised = is_r2 if clip_denoised is None else bool(clip_denoised)
+        if clip_denoised and not is_r2:
+            raise ValueError("[-1,1] clean-sample bounds are only valid for radial_q95_sqrt (R2)")
         log_amp_norm_fake = self.diffusion.sample(
-            shape, K=K, condition=condition
+            shape, K=K, condition=condition,
+            denoised_bounds=(-1.0, 1.0) if clip_denoised else None,
+            preserve_marginals=is_r2,
         )  # (B,C,H,W), khong gian chuan hoa
+        if not bool(torch.isfinite(log_amp_norm_fake).all()):
+            raise FloatingPointError("Nonfinite DDPM sample before representation decoding")
+        self.last_sampling_report = {
+            "normalized_out_of_range_rate": float((log_amp_norm_fake.abs() > 1).float().mean()),
+            "normalized_boundary_rate": float((log_amp_norm_fake.abs() >= 0.9999).float().mean()),
+            "clip_denoised": clip_denoised,
+            "sampler_policy": ("r2_posterior_x0_bounded_v1" if clip_denoised else
+                               "r2_eps_consistent_respacing_v1" if is_r2 else "legacy_eps_v1"),
+            **self.diffusion.last_sampling_stats,
+        }
+        if isinstance(self.normalization_stats, RadialAmplitudeStats):
+            if self.normalization_stats.mode == "radial_q95_sqrt":
+                amplitude_fake = self.normalization_stats.decode(log_amp_norm_fake)
+            else:
+                amplitude_fake = self.normalization_stats.decode(log_amp_norm_fake.clamp(-normalized_clip, normalized_clip))
+            return FrequencyUtils.enforce_amplitude_conjugate_symmetry(amplitude_fake)
         # The synthetic-quality policy limits the generated value to the central
         # source-train normalization range before inverse-log expansion.  A
         # configurable 3-sigma default is far safer than the old [-10, 10]
         # range, which could turn a moderate DDPM error into enormous FFT energy.
-        normalized_clip = float(normalized_clip)
-        if normalized_clip <= 0:
-            raise ValueError("normalized_clip must be > 0")
         log_amp_norm_fake = torch.clamp(
             log_amp_norm_fake,
             min=-normalized_clip,

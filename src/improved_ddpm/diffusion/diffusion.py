@@ -18,7 +18,8 @@ Day cung la class GaussianDiffusion tong hop: ket noi NoiseSchedule + UNet +
 losses + sampling thanh 1 API don gian (training_loss(), sample()).
 """
 
-from typing import List
+from typing import List, Optional, Tuple
+import math
 import torch
 
 from .schedule import NoiseSchedule
@@ -46,22 +47,32 @@ class RespacedSchedule:
     tinh lai beta_S va beta_tilde_S theo cong thuc o tren.
     """
 
-    def __init__(self, base_schedule: NoiseSchedule, respaced_steps: List[int]):
+    def __init__(self, base_schedule: NoiseSchedule, respaced_steps: List[int], preserve_marginals: bool = False):
         self.base = base_schedule
         self.steps = respaced_steps  # vi du [0, 20, 40, ..., 980], do dai K
         device = base_schedule.alphas_cumprod.device
 
         # alpha_bar tai cac buoc da chon
         ac = base_schedule.alphas_cumprod[respaced_steps]                  # (K,)
-        ac_prev = torch.cat([torch.tensor([1.0], device=device), ac[:-1]])  # (K,)
-
-        betas_new = 1.0 - (ac / ac_prev)
-        betas_new = torch.clamp(betas_new, max=0.999)
+        # R2: preserve the forward marginals exactly when skipping timesteps.
+        # A second beta cap would change alpha=1-beta while retaining old
+        # alpha_bar, making the reverse coefficients inconsistent. Float64
+        # prevents terminal respaced beta rounding to 1 for small K.
+        if preserve_marginals:
+            ac = ac.double()
+        ac_prev = torch.cat([torch.ones(1, device=device, dtype=ac.dtype), ac[:-1]])
+        ratio = ac / ac_prev
+        betas_new = 1.0 - ratio
+        if not preserve_marginals:
+            betas_new = torch.clamp(betas_new, max=0.999)  # legacy R0/R1 path
 
         self.alphas_cumprod = ac
         self.alphas_cumprod_prev = ac_prev
         self.betas = betas_new
-        self.alphas = 1.0 - betas_new
+        self.alphas = ratio if preserve_marginals else 1.0 - betas_new
+
+        self.posterior_mean_coef1 = betas_new * torch.sqrt(ac_prev) / (1.0 - ac)
+        self.posterior_mean_coef2 = (1.0 - ac_prev) * torch.sqrt(self.alphas) / (1.0 - ac)
 
         self.posterior_variance = betas_new * (1.0 - ac_prev) / (1.0 - ac)
         self.posterior_log_variance_clipped = torch.log(
@@ -107,7 +118,8 @@ class GaussianDiffusion:
 
     # ----------------------- Sampling (full T buoc) -----------------------
     @torch.no_grad()
-    def p_sample_step(self, x_t, t_tensor, t_index, schedule, condition=None):
+    def p_sample_step(self, x_t, t_tensor, t_index, schedule, condition=None,
+                      denoised_bounds: Optional[Tuple[float, float]] = None):
         """
         Mot buoc sampling DDPM (ho tro ca full-step va respaced):
             x_{t-1} = mu_theta(x_t,t) + sigma_theta(x_t,t) * z ,  z ~ N(0,I) (z=0 khi t_index==0)
@@ -119,17 +131,43 @@ class GaussianDiffusion:
         )
         eps_theta, v = model_output_to_eps_and_v(model_out)
 
-        beta_t = schedule.betas[t_index].view(-1, 1, 1, 1)
-        alpha_t = schedule.alphas[t_index].view(-1, 1, 1, 1)
-        ac_t = schedule.alphas_cumprod[t_index].view(-1, 1, 1, 1)
+        beta_t = schedule.betas[t_index].view(-1, 1, 1, 1).to(x_t)
+        alpha_t = schedule.alphas[t_index].view(-1, 1, 1, 1).to(x_t)
+        ac_t = schedule.alphas_cumprod[t_index].view(-1, 1, 1, 1).to(x_t)
         sqrt_one_minus_ac = torch.sqrt(1.0 - ac_t)
 
-        # mu_theta tu eps_theta (cong thuc DDPM chuan)
-        mean = (1.0 / torch.sqrt(alpha_t)) * (x_t - (beta_t / sqrt_one_minus_ac) * eps_theta)
+        # Only clean prediction is bounded. The noisy state x_t is never
+        # clipped. The raw prediction is measured BEFORE this stabilization.
+        if denoised_bounds is not None or getattr(self, "_diagnostic_bounds", None) is not None:
+            raw_x0 = (x_t - sqrt_one_minus_ac * eps_theta) / torch.sqrt(ac_t)
+            if not bool(torch.isfinite(raw_x0).all()):
+                raise FloatingPointError("Nonfinite clean prediction during DDPM sampling")
+            if getattr(self, "_collect_sampling_stats", False):
+                lo, hi = self._diagnostic_bounds
+                rejected = ((raw_x0 < lo) | (raw_x0 > hi)).float()
+                accum = self._sampling_accumulator
+                accum["count"] += raw_x0.numel()
+                accum["outside"] += float(rejected.sum())
+                accum["abs_max"] = max(accum["abs_max"], float(raw_x0.abs().max()))
+                final = raw_x0[t_index == 0]
+                if final.numel():
+                    accum["last_count"] += final.numel()
+                    accum["last_outside"] += float(((final < lo) | (final > hi)).float().sum())
+                    accum["last_abs_max"] = max(accum["last_abs_max"], float(final.abs().max()))
+        if denoised_bounds is not None:
+            clean_x0 = raw_x0.clamp(*denoised_bounds)
+            coef1 = schedule.posterior_mean_coef1[t_index].view(-1, 1, 1, 1).to(x_t)
+            coef2 = schedule.posterior_mean_coef2[t_index].view(-1, 1, 1, 1).to(x_t)
+            mean = coef1 * clean_x0 + coef2 * x_t
+            # At t=0 the posterior is exactly the clean sample; avoid float32
+            # coefficient cancellation sending it just outside its bounds.
+            mean = torch.where((t_index == 0).view(-1, 1, 1, 1), clean_x0, mean)
+        else:
+            mean = (1.0 / torch.sqrt(alpha_t)) * (x_t - (beta_t / sqrt_one_minus_ac) * eps_theta)
 
         # Sigma_theta = exp(v*log(beta_t) + (1-v)*log(beta_tilde_t))  (Module 3)
         log_beta_t = torch.log(beta_t)
-        log_beta_tilde_t = schedule.posterior_log_variance_clipped[t_index].view(-1, 1, 1, 1)
+        log_beta_tilde_t = schedule.posterior_log_variance_clipped[t_index].view(-1, 1, 1, 1).to(x_t)
         # Match training-time learned-range stabilization.
         v_frac = torch.sigmoid(v)
         log_var = v_frac * log_beta_t + (1.0 - v_frac) * log_beta_tilde_t
@@ -142,7 +180,9 @@ class GaussianDiffusion:
         return x_prev
 
     @torch.no_grad()
-    def sample(self, shape, K: int = None, condition=None):
+    def sample(self, shape, K: int = None, condition=None,
+               denoised_bounds: Optional[Tuple[float, float]] = None,
+               preserve_marginals: bool = False):
         """
         Sinh anh moi.
         Args:
@@ -150,21 +190,46 @@ class GaussianDiffusion:
             K: so buoc rut gon. Neu None -> dung full T buoc.
                Neu duoc cung cap (vd 50, 100) -> dung respaced schedule (fast sampling).
         """
-        if K is None:
-            return self._sample_full(shape, condition=condition)
-        return self._sample_fast(shape, K, condition=condition)
+        if K is not None and K < 1:
+            raise ValueError("Sampling K must be positive")
+        if denoised_bounds is not None and (
+            len(denoised_bounds) != 2 or not all(math.isfinite(x) for x in denoised_bounds)
+            or denoised_bounds[0] >= denoised_bounds[1]
+        ):
+            raise ValueError("denoised_bounds must be two finite increasing values")
+        self._diagnostic_bounds = denoised_bounds or ((-1.0, 1.0) if preserve_marginals else None)
+        self._collect_sampling_stats = self._diagnostic_bounds is not None
+        self._sampling_accumulator = dict(count=0, outside=0.0, abs_max=0.0,
+                                          last_count=0, last_outside=0.0, last_abs_max=0.0)
+        try:
+            x = (self._sample_full(shape, condition=condition, denoised_bounds=denoised_bounds)
+                 if K is None else self._sample_fast(shape, K, condition=condition,
+                                                     denoised_bounds=denoised_bounds,
+                                                     preserve_marginals=preserve_marginals))
+            a = self._sampling_accumulator
+            self.last_sampling_stats = {
+                "clean_prediction_out_of_range_rate": a["outside"] / max(a["count"], 1),
+                "clean_prediction_last_out_of_range_rate": a["last_outside"] / max(a["last_count"], 1),
+                "clean_prediction_abs_max": a["abs_max"],
+                "clean_prediction_last_abs_max": a["last_abs_max"],
+            } if self._collect_sampling_stats else {}
+            return x
+        finally:
+            self._collect_sampling_stats = False
+            self._diagnostic_bounds = None
 
     @torch.no_grad()
-    def _sample_full(self, shape, condition=None):
+    def _sample_full(self, shape, condition=None, denoised_bounds=None):
         x = torch.randn(shape, device=self.device)
         B = shape[0]
         for i in reversed(range(self.T)):
             t_index = torch.full((B,), i, device=self.device, dtype=torch.long)
-            x = self.p_sample_step(x, t_index, t_index, self.schedule, condition=condition)
+            x = self.p_sample_step(x, t_index, t_index, self.schedule, condition=condition,
+                                   denoised_bounds=denoised_bounds)
         return x
 
     @torch.no_grad()
-    def _sample_fast(self, shape, K: int, condition=None):
+    def _sample_fast(self, shape, K: int, condition=None, denoised_bounds=None, preserve_marginals=False):
         """
         Fast sampling voi K buoc << T (vd K=50, T=4000).
         1) Chon K chi so buoc phan bo deu trong [0, T-1].
@@ -173,7 +238,7 @@ class GaussianDiffusion:
            de mang tu dieu chinh ty le (khong can huan luyen lai).
         """
         respaced_steps = make_respaced_steps(self.T, K)
-        rs = RespacedSchedule(self.schedule, respaced_steps)
+        rs = RespacedSchedule(self.schedule, respaced_steps, preserve_marginals=preserve_marginals)
 
         x = torch.randn(shape, device=self.device)
         B = shape[0]
@@ -183,5 +248,6 @@ class GaussianDiffusion:
             idx_tensor = torch.full((B,), i, device=self.device, dtype=torch.long)
             # timestep GOC (trong khong gian 0..T-1) de dua vao UNet
             t_original = rs.original_t[i].expand(B)
-            x = self.p_sample_step(x, t_original, idx_tensor, rs, condition=condition)
+            x = self.p_sample_step(x, t_original, idx_tensor, rs, condition=condition,
+                                   denoised_bounds=denoised_bounds)
         return x

@@ -21,6 +21,11 @@ from improved_ddpm.fas.synthetic_quality import (
     rbf_mmd_unbiased,
 )
 from improved_ddpm.scripts.pretrain_amplitude_ddpm import _build_ddpm
+from improved_ddpm.fas.ddpm_representation import (
+    validate_ddpm_checkpoint, spectral_comparison, source_reference_batches,
+    representation_signature, radial_coordinate,
+    save_spectral_diagnostics,
+)
 from improved_ddpm.scripts.train import (
     load_config,
     load_ddpm_frequency_stats,
@@ -44,6 +49,8 @@ def parse_args():
     parser.add_argument("--sampling-k", nargs="+", type=int, default=[20, 50, 100])
     parser.add_argument("--count", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--clip-denoised", choices=("auto", "on", "off"), default="auto",
+                        help="R2 clean-sample stabilization; off enables a same-checkpoint diagnostic control")
     return parser.parse_args()
 
 
@@ -72,6 +79,7 @@ def main():
     checkpoint = torch.load(_resolve(args.checkpoint), map_location=device, weights_only=False)
     if checkpoint.get("policy") != "source_train_attack_only":
         raise RuntimeError("K sweep requires a source_train_attack_only checkpoint")
+    validate_ddpm_checkpoint(checkpoint, model)
     model.unet.load_state_dict(checkpoint["unet_state_dict"])
     model.unet.eval()
 
@@ -84,7 +92,7 @@ def main():
         split="train",
         return_metadata=False,
     )
-    live, attack = _examples(dataset, args.count)
+    live, attack, attack_b = source_reference_batches(dataset, args.count, seed)
     quality_cfg = SyntheticQualityConfig.from_mapping(cfg["stage6"]["quality_control"])
     attack_psd = radial_power_spectrum(attack)
     attack_hf = float(high_frequency_energy_ratio(attack).mean().item())
@@ -93,7 +101,8 @@ def main():
     for sampling_k in sorted(set(args.sampling_k)):
         set_global_seed(seed)  # same parent images and initial RNG policy for every K
         controller = SyntheticQualityController(quality_cfg)
-        synthetic_parts, accepted_parts = [], []
+        synthetic_parts, accepted_parts, raw_clip_rates, direct_hf, normalized_clip_rates, amplitude_parts = [], [], [], [], [], []
+        sampling_reports = []
         for start in range(0, args.count, args.batch_size):
             parent = live[start:start + args.batch_size].to(device)
             _, phase = FrequencyUtils.fft_decompose(parent)
@@ -101,8 +110,16 @@ def main():
                 parent.shape,
                 K=sampling_k,
                 normalized_clip=quality_cfg.normalized_amplitude_clip,
+                clip_denoised=None if args.clip_denoised == "auto" else args.clip_denoised == "on",
             )
             candidate = FrequencyUtils.ifft_reconstruct(amplitude, phase)
+            amplitude_parts.append(amplitude.cpu())
+            raw_clip_rates.append(((candidate < -1) | (candidate > 1)).float().flatten(1).mean(1).cpu())
+            radius = radial_coordinate(*amplitude.shape[-2:], device=device) * (2 ** 0.5)
+            energy = amplitude.square()
+            direct_hf.append((energy[..., radius >= 0.35].sum(-1) / energy.flatten(2).sum(-1).clamp_min(1e-12)).mean(1).cpu())
+            normalized_clip_rates.append(model.last_sampling_report["normalized_out_of_range_rate"])
+            sampling_reports.append((dict(model.last_sampling_report), parent.shape[0]))
             accepted, _ = controller.validate_candidates(
                 candidate, parent, parent, attack[:parent.shape[0]].to(device)
             )
@@ -122,19 +139,33 @@ def main():
             "high_frequency_ratio_attack": attack_hf,
             "high_frequency_absolute_error": abs(hf - attack_hf),
             "finite_rate": float(torch.isfinite(synthetic).flatten(1).all(dim=1).float().mean().item()),
+            "raw_synthetic_pixel_clip_rate": float(torch.cat(raw_clip_rates).mean()),
+            "ddpm_amplitude_high_frequency_ratio": float(torch.cat(direct_hf).mean()),
+            "normalized_out_of_range_rate": sum(normalized_clip_rates) / len(normalized_clip_rates),
+            **spectral_comparison(synthetic, attack, attack_b),
         }
+        for name in ("clean_prediction_out_of_range_rate", "clean_prediction_last_out_of_range_rate",
+                     "normalized_boundary_rate"):
+            row[name] = (sum(report[name] * count for report, count in sampling_reports) / args.count
+                         if all(name in report for report, _ in sampling_reports) else None)
+        for name in ("clean_prediction_abs_max", "clean_prediction_last_abs_max"):
+            row[name] = max(report[name] for report, _ in sampling_reports) if all(name in report for report, _ in sampling_reports) else None
+        row["clip_denoised"] = sampling_reports[0][0]["clip_denoised"]
+        row["sampler_policy"] = sampling_reports[0][0]["sampler_policy"]
         rows.append(row)
         grid = []
         for index in range(min(8, synthetic.shape[0])):
             grid.extend([(live[index] + 1) / 2, (synthetic[index] + 1) / 2])
         save_image(torch.stack(grid), output / f"live_vs_synthetic_k{sampling_k}.png", nrow=2)
+        save_spectral_diagnostics(output, live, attack, torch.cat(amplitude_parts), synthetic, suffix=f"_k{sampling_k}")
         print(json.dumps(row, indent=2))
 
     recommended = min(
         rows,
         key=lambda row: (
             -row["acceptance_rate"],
-            row["radial_psd_mmd_attack"],
+            row["radial_profile_l1_synthetic_real"],
+            row["band_high_wasserstein_synthetic_real"],
             row["high_frequency_absolute_error"],
             row["sampling_k"],
         ),
@@ -151,11 +182,16 @@ def main():
         "recommended_sampling_k": int(recommended["sampling_k"]),
         "selection_order": [
             "maximize_acceptance_rate",
-            "minimize_radial_psd_mmd_attack",
+            "minimize_radial_profile_l1_synthetic_real",
+            "minimize_high_band_wasserstein",
             "minimize_high_frequency_absolute_error",
             "prefer_lower_k_on_tie",
         ],
         "ema": False,
+        "ddpm_representation": representation_signature(stats, model.radius_conditioning),
+        "quality_status": "all_candidates_rejected" if all(r["accepted"] == 0 for r in rows) else "inspect_source_diagnostics",
+        "sampler_policy": rows[0]["sampler_policy"],
+        "clip_denoised": rows[0]["clip_denoised"],
     }
     (output / "sampling_k_selection.json").write_text(
         json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8"
